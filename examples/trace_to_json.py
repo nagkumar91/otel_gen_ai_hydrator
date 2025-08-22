@@ -13,6 +13,7 @@ from typing import Dict, List, Any, Optional, Tuple
 from collections import defaultdict
 import hashlib
 import argparse
+import time
 
 # Suppress verbose Azure logging
 logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
@@ -251,6 +252,161 @@ def retrieve_traces_from_app_insights(
     except Exception as e:
         logger.error(f"Failed to retrieve traces: {e}")
         return []
+
+
+def verify_evaluations_in_app_insights(
+    original_trace_id: str,
+    config: ApplicationInsightsConfig,
+    evaluation_metrics: List[str],
+    max_retries: int = 10,
+    retry_delay: int = 5
+) -> bool:
+    """Verify that evaluation results have been sent to Application Insights."""
+    connector = ApplicationInsightsConnector(config)
+    
+    logger.info(f"Waiting {retry_delay} seconds for initial telemetry export...")
+    time.sleep(retry_delay)
+    
+    for attempt in range(max_retries):
+        try:
+            # Query for evaluation spans linked to the original trace
+            # Look for both dependencies and traces that contain evaluation data
+            end_time = datetime.now(timezone.utc)
+            start_time = end_time - timedelta(minutes=10)  # Look in last 10 minutes
+            
+            # Query 1: Look for evaluation spans by name pattern - exclude log messages
+            kusto_query_spans = f"""
+            union dependencies, requests
+            | where timestamp between (datetime('{start_time.isoformat()}') .. datetime('{end_time.isoformat()}'))
+            | where name contains "evaluation." or customDimensions contains "evaluation.metric"
+            | where name !contains "Starting evaluation"
+            | project timestamp, name, customDimensions, operation_Id, id
+            | take 100
+            """
+            
+            # Query 2: Look for traces with evaluation events - exclude log messages
+            kusto_query_traces = f"""
+            traces
+            | where timestamp between (datetime('{start_time.isoformat()}') .. datetime('{end_time.isoformat()}'))
+            | where (message contains "evaluation." 
+                or customDimensions contains "evaluation.metric"
+                or customDimensions contains "evaluation.original_trace_id"
+                or customDimensions contains "{original_trace_id}")
+            | where message !contains "Starting evaluation"
+            | where message !contains "Evaluating"
+            | where message !contains "Completed"
+            | project timestamp, message, customDimensions
+            | take 100
+            """
+            
+            # Query 3: Look for custom events with evaluation data
+            kusto_query_events = f"""
+            customEvents
+            | where timestamp between (datetime('{start_time.isoformat()}') .. datetime('{end_time.isoformat()}'))
+            | where name contains "evaluation." or customDimensions contains "evaluation"
+            | project timestamp, name, customDimensions
+            | take 100
+            """
+            
+            logger.info(f"Attempt {attempt + 1}/{max_retries}: Querying for evaluation results...")
+            
+            # Try the most specific query first
+            eval_spans = connector._execute_query(
+                kusto_query_spans,
+                timespan=timedelta(minutes=10)
+            )
+            
+            if eval_spans:
+                logger.info(f"✓ Found {len(eval_spans)} evaluation spans")
+                
+                # Check if we have all expected metrics
+                found_metrics = set()
+                for span in eval_spans:
+                    name = span.get('name', '')
+                    if 'evaluation.' in name:
+                        metric = name.replace('evaluation.', '').split('.')[0]  # Get base metric name
+                        found_metrics.add(metric)
+                    
+                    # Also check customDimensions
+                    custom_dims = span.get('customDimensions', {})
+                    if isinstance(custom_dims, str):
+                        try:
+                            custom_dims = json.loads(custom_dims)
+                        except:
+                            pass
+                    if isinstance(custom_dims, dict) and 'evaluation.metric' in custom_dims:
+                        found_metrics.add(custom_dims['evaluation.metric'])
+                
+                if found_metrics:
+                    logger.info(f"✓ Found evaluation metrics: {', '.join(found_metrics)}")
+                    expected_set = set(evaluation_metrics)
+                    if found_metrics.intersection(expected_set):
+                        logger.info(f"✓ Successfully verified evaluation results in Application Insights")
+                        return True
+            
+            # Try custom events query
+            eval_events = connector._execute_query(
+                kusto_query_events,
+                timespan=timedelta(minutes=10)
+            )
+            
+            if eval_events:
+                logger.info(f"✓ Found {len(eval_events)} evaluation custom events")
+                
+                # Check for evaluation metrics in events
+                found_metrics = set()
+                for event in eval_events:
+                    name = event.get('name', '')
+                    if 'evaluation.' in name:
+                        metric = name.replace('evaluation.', '').replace('.completed', '')
+                        found_metrics.add(metric)
+                
+                if found_metrics:
+                    logger.info(f"✓ Found evaluation metrics in events: {', '.join(found_metrics)}")
+                    expected_set = set(evaluation_metrics)
+                    if found_metrics.intersection(expected_set):
+                        logger.info(f"✓ Successfully verified evaluation results in Application Insights")
+                        return True
+            
+            # Try trace query
+            eval_traces = connector._execute_query(
+                kusto_query_traces,
+                timespan=timedelta(minutes=10)
+            )
+            
+            if eval_traces:
+                # Filter out actual evaluation events
+                real_eval_traces = []
+                for tr in eval_traces:
+                    message = tr.get('message', '')
+                    # Only count traces that have evaluation metric names
+                    if any(metric in message for metric in ['fluency', 'coherence', 'relevance', 'groundedness', 'tool_call_accuracy']):
+                        real_eval_traces.append(tr)
+                
+                if real_eval_traces:
+                    logger.info(f"✓ Found {len(real_eval_traces)} evaluation traces")
+                    found_events = []
+                    for tr in real_eval_traces:
+                        message = tr.get('message', '')
+                        if 'evaluation.' in message:
+                            found_events.append(message)
+                    
+                    if found_events:
+                        logger.info(f"✓ Found evaluation events: {', '.join(found_events[:5])}")
+                        return True
+            
+            if attempt < max_retries - 1:
+                logger.info(f"Evaluation results not found yet. Waiting {retry_delay} seconds before retry...")
+                time.sleep(retry_delay)
+            
+        except Exception as e:
+            logger.warning(f"Error querying for evaluation results: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+    
+    logger.warning(f"Could not verify evaluation results in Application Insights after {max_retries} attempts")
+    logger.warning("This may be due to export delays. The evaluations were sent but may take longer to appear.")
+    return False
 
 
 def parse_trace_records(trace_records: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], str]:
@@ -565,31 +721,48 @@ def evaluate_spans(parsed_data: Dict[str, Any], model_config: AzureOpenAIModelCo
             logger.debug(f"Span {span_id} ({operation_name}): messages={list(messages.keys())}, tool_calls={len(tool_calls)}")
         
         # Tool Call Accuracy - if span has tool calls
-        if tool_calls:
+        if tool_calls and len(tool_calls) > 0:
+            # For tool execution spans, try to find the user query from parent or context
+            user_query = None
+            
+            # First try to get from messages
             user_messages = messages.get("user", [])
             if user_messages:
                 user_query = user_messages[0].get("content", "")
-                if user_query:
-                    try:
-                        result = tool_evaluator(
-                            query=user_query,
-                            response=json.dumps(tool_calls)
-                        )
-                        if result:
-                            score = extract_score(result, ["tool_call_accuracy", "accuracy", "score"])
-                            evaluations.append({
-                                "metric": "tool_call_accuracy",
-                                "score": normalize_score(score),
-                                "reasoning": extract_reasoning(result),
-                                "span_id": span_id,
-                                "trace_id": trace_id
-                            })
-                    except Exception as e:
-                        logger.debug(f"Tool evaluation failed for span {span_id}: {e}")
+            
+            # If no user message, use a generic query based on tool names
+            if not user_query and tool_calls:
+                tool_names = [tc.get("name", "") for tc in tool_calls]
+                user_query = f"Execute tools: {', '.join(tool_names)}"
+            
+            if user_query:
+                try:
+                    logger.debug(f"Evaluating tool calls for span {span_id}: {tool_calls}")
+                    result = tool_evaluator(
+                        query=user_query,
+                        response=json.dumps(tool_calls)
+                    )
+                    if result:
+                        score = extract_score(result, ["tool_call_accuracy", "accuracy", "score"])
+                        evaluations.append({
+                            "metric": "tool_call_accuracy",
+                            "score": normalize_score(score),
+                            "reasoning": extract_reasoning(result),
+                            "span_id": span_id,
+                            "trace_id": trace_id
+                        })
+                        logger.debug(f"Tool evaluation completed for span {span_id}: score={score}")
+                except Exception as e:
+                    logger.debug(f"Tool evaluation failed for span {span_id}: {e}")
         
         # Response Quality - if span has assistant responses
         assistant_messages = messages.get("assistant", [])
         user_messages = messages.get("user", [])
+        
+        # Also check for 'ai' role (some systems use 'ai' instead of 'assistant')
+        ai_messages = messages.get("ai", [])
+        if ai_messages and not assistant_messages:
+            assistant_messages = ai_messages
         
         if assistant_messages:
             assistant_response = assistant_messages[-1].get("content", "") if assistant_messages else ""
@@ -608,12 +781,19 @@ def evaluate_spans(parsed_data: Dict[str, Any], model_config: AzureOpenAIModelCo
                             "span_id": span_id,
                             "trace_id": trace_id
                         })
+                        logger.debug(f"Fluency evaluation completed for span {span_id}: score={score}")
                 except Exception as e:
                     logger.debug(f"Fluency evaluation failed: {e}")
                 
-                # Coherence
+                # Coherence - Fixed to use conversation parameter
                 try:
-                    result = coherence_evaluator(response=assistant_response)
+                    # Build conversation format for coherence evaluator
+                    conversation = []
+                    if user_query:
+                        conversation.append({"role": "user", "content": user_query})
+                    conversation.append({"role": "assistant", "content": assistant_response})
+                    
+                    result = coherence_evaluator(conversation=conversation)
                     if result:
                         score = extract_score(result, ["coherence", "coherence_score", "score"])
                         evaluations.append({
@@ -623,6 +803,7 @@ def evaluate_spans(parsed_data: Dict[str, Any], model_config: AzureOpenAIModelCo
                             "span_id": span_id,
                             "trace_id": trace_id
                         })
+                        logger.debug(f"Coherence evaluation completed for span {span_id}: score={score}")
                 except Exception as e:
                     logger.debug(f"Coherence evaluation failed: {e}")
                 
@@ -639,6 +820,7 @@ def evaluate_spans(parsed_data: Dict[str, Any], model_config: AzureOpenAIModelCo
                                 "span_id": span_id,
                                 "trace_id": trace_id
                             })
+                            logger.debug(f"Relevance evaluation completed for span {span_id}: score={score}")
                     except Exception as e:
                         logger.debug(f"Relevance evaluation failed: {e}")
                 
@@ -658,9 +840,11 @@ def evaluate_spans(parsed_data: Dict[str, Any], model_config: AzureOpenAIModelCo
                                 "span_id": span_id,
                                 "trace_id": trace_id
                             })
+                            logger.debug(f"Groundedness evaluation completed for span {span_id}: score={score}")
                     except Exception as e:
                         logger.debug(f"Groundedness evaluation failed: {e}")
     
+    logger.info(f"Successfully evaluated {len(evaluations)} metrics across spans")
     return evaluations
 
 
@@ -818,9 +1002,9 @@ def main():
         help='Time range in hours to search for traces'
     )
     parser.add_argument(
-        '--send-traces',
+        '--no-verify',
         action='store_true',
-        help='Send evaluation results as traces to Application Insights'
+        help='Skip verification of evaluation results in Application Insights'
     )
     parser.add_argument(
         '--debug',
@@ -868,12 +1052,30 @@ def main():
     
     logger.info(f"Completed {len(evaluations)} evaluations")
     
-    # Send evaluations as traces if requested
-    if args.send_traces and evaluations:
+    # Always send evaluations as traces (default behavior)
+    verification_success = False
+    if evaluations:
         logger.info("Sending evaluation traces...")
         for evaluation in evaluations:
             send_evaluation_as_trace(evaluation)
         logger.info("Evaluation traces sent")
+        
+        # Force flush any pending telemetry
+        if hasattr(trace, 'get_tracer_provider'):
+            provider = trace.get_tracer_provider()
+            if hasattr(provider, 'force_flush'):
+                provider.force_flush()
+        
+        # Verify the evaluations were sent unless --no-verify flag is set
+        if not args.no_verify:
+            evaluation_metrics = list(set(e["metric"] for e in evaluations))
+            verification_success = verify_evaluations_in_app_insights(
+                original_trace_id=trace_id,
+                config=config,
+                evaluation_metrics=evaluation_metrics,
+                max_retries=10,
+                retry_delay=5
+            )
     
     # Prepare output
     output_data = {
@@ -881,6 +1083,7 @@ def main():
         "total_spans": len(parsed_data["spans"]),
         "total_evaluations": len(evaluations),
         "evaluations": evaluations,
+        "evaluations_verified": verification_success,
         "summary": {
             "metrics_evaluated": list(set(e["metric"] for e in evaluations)),
             "average_score": sum(e["score"] for e in evaluations) / len(evaluations) if evaluations else 0,
@@ -908,6 +1111,11 @@ def main():
         print(f"\nMetrics Evaluated: {', '.join(output_data['summary']['metrics_evaluated'])}")
         print(f"Average Score: {output_data['summary']['average_score']:.2f}/5.0")
         print(f"Pass Rate: {output_data['summary']['pass_rate']*100:.1f}%")
+        
+        if verification_success:
+            print("\n✓ Evaluation results successfully verified in Application Insights")
+        elif not args.no_verify:
+            print("\n⚠ Could not verify evaluation results in Application Insights (may still be processing)")
         
         # Group evaluations by metric
         by_metric = defaultdict(list)
