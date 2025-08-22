@@ -270,27 +270,29 @@ def verify_evaluations_in_app_insights(
     for attempt in range(max_retries):
         try:
             # Query for evaluation spans linked to the original trace
-            # Look for both dependencies and traces that contain evaluation data
             end_time = datetime.now(timezone.utc)
-            start_time = end_time - timedelta(minutes=10)  # Look in last 10 minutes
+            start_time = end_time - timedelta(minutes=10)
             
-            # Query 1: Look for evaluation spans by name pattern - exclude log messages
+            # Query 1: Look for evaluation spans by name pattern with GenAI semantic conventions
             kusto_query_spans = f"""
             union dependencies, requests
             | where timestamp between (datetime('{start_time.isoformat()}') .. datetime('{end_time.isoformat()}'))
-            | where name contains "evaluation." or customDimensions contains "evaluation.metric"
+            | where name contains "evaluation." 
+                or customDimensions contains "gen_ai.evaluation.name"
+                or customDimensions contains "gen_ai.evaluation.score.value"
             | where name !contains "Starting evaluation"
             | project timestamp, name, customDimensions, operation_Id, id
             | take 100
             """
             
-            # Query 2: Look for traces with evaluation events - exclude log messages
+            # Query 2: Look for traces with evaluation events
             kusto_query_traces = f"""
             traces
             | where timestamp between (datetime('{start_time.isoformat()}') .. datetime('{end_time.isoformat()}'))
-            | where (message contains "evaluation." 
-                or customDimensions contains "evaluation.metric"
-                or customDimensions contains "evaluation.original_trace_id"
+            | where (message contains "gen_ai.evaluation." 
+                or customDimensions contains "gen_ai.evaluation.name"
+                or customDimensions contains "gen_ai.evaluation.score.value"
+                or customDimensions contains "gen_ai.evaluation.original_trace_id"
                 or customDimensions contains "{original_trace_id}")
             | where message !contains "Starting evaluation"
             | where message !contains "Evaluating"
@@ -303,7 +305,9 @@ def verify_evaluations_in_app_insights(
             kusto_query_events = f"""
             customEvents
             | where timestamp between (datetime('{start_time.isoformat()}') .. datetime('{end_time.isoformat()}'))
-            | where name contains "evaluation." or customDimensions contains "evaluation"
+            | where name contains "gen_ai.evaluation." 
+                or name contains "evaluation."
+                or customDimensions contains "gen_ai.evaluation"
             | project timestamp, name, customDimensions
             | take 100
             """
@@ -324,18 +328,19 @@ def verify_evaluations_in_app_insights(
                 for span in eval_spans:
                     name = span.get('name', '')
                     if 'evaluation.' in name:
-                        metric = name.replace('evaluation.', '').split('.')[0]  # Get base metric name
+                        metric = name.replace('evaluation.', '').split('.')[0]
                         found_metrics.add(metric)
                     
-                    # Also check customDimensions
+                    # Also check customDimensions for gen_ai.evaluation.name
                     custom_dims = span.get('customDimensions', {})
                     if isinstance(custom_dims, str):
                         try:
                             custom_dims = json.loads(custom_dims)
                         except:
                             pass
-                    if isinstance(custom_dims, dict) and 'evaluation.metric' in custom_dims:
-                        found_metrics.add(custom_dims['evaluation.metric'])
+                    if isinstance(custom_dims, dict):
+                        if 'gen_ai.evaluation.name' in custom_dims:
+                            found_metrics.add(custom_dims['gen_ai.evaluation.name'])
                 
                 if found_metrics:
                     logger.info(f"✓ Found evaluation metrics: {', '.join(found_metrics)}")
@@ -357,7 +362,13 @@ def verify_evaluations_in_app_insights(
                 found_metrics = set()
                 for event in eval_events:
                     name = event.get('name', '')
-                    if 'evaluation.' in name:
+                    if 'gen_ai.evaluation.' in name:
+                        # Extract metric name from event name like "gen_ai.evaluation.fluency.completed"
+                        parts = name.split('.')
+                        if len(parts) >= 4:
+                            metric = parts[3]  # gen_ai.evaluation.{metric}.completed
+                            found_metrics.add(metric)
+                    elif 'evaluation.' in name:
                         metric = name.replace('evaluation.', '').replace('.completed', '')
                         found_metrics.add(metric)
                 
@@ -388,7 +399,7 @@ def verify_evaluations_in_app_insights(
                     found_events = []
                     for tr in real_eval_traces:
                         message = tr.get('message', '')
-                        if 'evaluation.' in message:
+                        if 'gen_ai.evaluation.' in message or 'evaluation.' in message:
                             found_events.append(message)
                     
                     if found_events:
@@ -413,12 +424,21 @@ def parse_trace_records(trace_records: List[Dict[str, Any]]) -> Tuple[Dict[str, 
     """Parse trace records and convert to evaluation-ready format."""
     grouped_records = defaultdict(list)
     trace_id = None
+    agent_id = None  # Track agent ID from the trace
     
     for record in trace_records:
         item_type = record.get('itemType', 'unknown')
         grouped_records[item_type].append(record)
         if not trace_id:
             trace_id = record.get('operation_Id', '')
+        
+        # Extract agent ID from custom dimensions if present
+        custom_dims = record.get('customDimensions', {})
+        if isinstance(custom_dims, str):
+            try:
+                custom_dims = json.loads(custom_dims)
+            except:
+                custom_dims = {}
     
     spans = []
     span_map = {}  # Map span IDs to spans for easier access
@@ -458,6 +478,7 @@ def parse_trace_records(trace_records: List[Dict[str, Any]]) -> Tuple[Dict[str, 
                 "type": get_value_type(value),
                 "value": str(value)
             })
+
         
         spans.append(span)
         span_map[span_id] = span
@@ -520,109 +541,6 @@ def parse_trace_records(trace_records: List[Dict[str, Any]]) -> Tuple[Dict[str, 
         spans.append(span)
         span_map[span_id] = span
     
-    # Process trace logs and attach them to their parent spans
-    for tr in grouped_records.get('trace', []):
-        parent_id = tr.get('operation_ParentId', '').replace('-', '')[:16]
-        message = tr.get('message', '')
-        
-        if parent_id in span_map:
-            timestamp = parse_timestamp(tr.get('timestamp'))
-            
-            custom_dims = tr.get('customDimensions', {})
-            if isinstance(custom_dims, str):
-                try:
-                    custom_dims = json.loads(custom_dims)
-                except:
-                    custom_dims = {}
-            
-            # Handle gen_ai content events
-            if message == "gen_ai.content.prompt":
-                # Find the prompt content in the surrounding traces
-                # Look for traces with matching parent that have gen_ai.prompt in customDimensions
-                prompt_content = None
-                for other_tr in grouped_records.get('trace', []):
-                    if other_tr.get('operation_ParentId') == tr.get('operation_ParentId'):
-                        other_dims = other_tr.get('customDimensions', {})
-                        if isinstance(other_dims, str):
-                            try:
-                                other_dims = json.loads(other_dims)
-                            except:
-                                continue
-                        if 'gen_ai.prompt' in other_dims:
-                            prompt_content = other_dims['gen_ai.prompt']
-                            break
-                
-                if prompt_content:
-                    log_entry = {
-                        "timestamp": int(timestamp.timestamp() * 1_000_000),
-                        "fields": [
-                            {"key": "event.name", "type": "string", "value": "gen_ai.content.prompt"},
-                            {"key": "gen_ai.prompt", "type": "string", "value": prompt_content}
-                        ]
-                    }
-                    span_map[parent_id]["logs"].append(log_entry)
-            
-            elif message == "gen_ai.content.completion":
-                # Look for completion content
-                if "gen_ai.output.messages" in custom_dims:
-                    log_entry = {
-                        "timestamp": int(timestamp.timestamp() * 1_000_000),
-                        "fields": [
-                            {"key": "event.name", "type": "string", "value": "gen_ai.content.completion"},
-                            {"key": "gen_ai.output.messages", "type": "string", "value": custom_dims["gen_ai.output.messages"]}
-                        ]
-                    }
-                    span_map[parent_id]["logs"].append(log_entry)
-                elif "gen_ai.completion" in custom_dims:
-                    log_entry = {
-                        "timestamp": int(timestamp.timestamp() * 1_000_000),
-                        "fields": [
-                            {"key": "event.name", "type": "string", "value": "gen_ai.content.completion"},
-                            {"key": "gen_ai.completion", "type": "string", "value": custom_dims["gen_ai.completion"]}
-                        ]
-                    }
-                    span_map[parent_id]["logs"].append(log_entry)
-            
-            # Handle tool calls
-            elif "metadata.tool_calls" in custom_dims:
-                log_entry = {
-                    "timestamp": int(timestamp.timestamp() * 1_000_000),
-                    "fields": [
-                        {"key": "event.name", "type": "string", "value": "gen_ai.tool_calls"},
-                        {"key": "metadata.tool_calls", "type": "string", "value": custom_dims["metadata.tool_calls"]}
-                    ]
-                }
-                span_map[parent_id]["logs"].append(log_entry)
-    
-    # Now look for any dependency with gen_ai content in customDimensions
-    for dep in grouped_records.get('dependency', []):
-        span_id = dep.get('id', '').replace('-', '')[:16]
-        if span_id in span_map:
-            custom_dims = dep.get('customDimensions', {})
-            if isinstance(custom_dims, str):
-                try:
-                    custom_dims = json.loads(custom_dims)
-                except:
-                    custom_dims = {}
-            
-            # Check for tool results
-            if "gen_ai.tool.call.result" in custom_dims:
-                try:
-                    result = json.loads(custom_dims["gen_ai.tool.call.result"])
-                    if isinstance(result, dict):
-                        content = result.get("content", "")
-                        if content:
-                            timestamp = parse_timestamp(dep.get('timestamp'))
-                            span_map[span_id]["logs"].append({
-                                "timestamp": int(timestamp.timestamp() * 1_000_000),
-                                "fields": [
-                                    {"key": "event.name", "type": "string", "value": "gen_ai.tool.result"},
-                                    {"key": "gen_ai.tool.result", "type": "string", "value": content}
-                                ]
-                            })
-                except:
-                    pass
-    
     # Special handling: Look for chat dependencies which usually have prompts/completions
     for dep in grouped_records.get('dependency', []):
         if 'chat' in dep.get('name', '').lower():
@@ -678,7 +596,7 @@ def parse_trace_records(trace_records: List[Dict[str, Any]]) -> Tuple[Dict[str, 
                                 except:
                                     pass
     
-    return {
+    result = {
         "traceID": trace_id,
         "spans": spans,
         "processes": {
@@ -690,7 +608,13 @@ def parse_trace_records(trace_records: List[Dict[str, Any]]) -> Tuple[Dict[str, 
                 ]
             }
         }
-    }, trace_id
+    }
+    
+    # Add agent_id to metadata if found
+    if agent_id:
+        result["agent_id"] = agent_id
+    
+    return result, trace_id
 
 
 def evaluate_spans(parsed_data: Dict[str, Any], model_config: AzureOpenAIModelConfiguration) -> List[Dict[str, Any]]:
@@ -698,6 +622,7 @@ def evaluate_spans(parsed_data: Dict[str, Any], model_config: AzureOpenAIModelCo
     evaluations = []
     spans = parsed_data.get("spans", [])
     trace_id = parsed_data.get("traceID", "")
+    agent_id = parsed_data.get("agent_id", None)  # Get agent ID if available
     
     # Initialize evaluators
     tool_evaluator = ToolCallAccuracyEvaluator(model_config=model_config)
@@ -707,6 +632,8 @@ def evaluate_spans(parsed_data: Dict[str, Any], model_config: AzureOpenAIModelCo
     groundedness_evaluator = GroundednessEvaluator(model_config=model_config)
     
     logger.info(f"Evaluating {len(spans)} spans...")
+    if agent_id:
+        logger.info(f"Agent ID: {agent_id}")
     
     for span in spans:
         span_id = span["spanID"]
@@ -744,13 +671,16 @@ def evaluate_spans(parsed_data: Dict[str, Any], model_config: AzureOpenAIModelCo
                     )
                     if result:
                         score = extract_score(result, ["tool_call_accuracy", "accuracy", "score"])
-                        evaluations.append({
+                        eval_result = {
                             "metric": "tool_call_accuracy",
                             "score": normalize_score(score),
                             "reasoning": extract_reasoning(result),
                             "span_id": span_id,
                             "trace_id": trace_id
-                        })
+                        }
+                        if agent_id:
+                            eval_result["agent_id"] = agent_id
+                        evaluations.append(eval_result)
                         logger.debug(f"Tool evaluation completed for span {span_id}: score={score}")
                 except Exception as e:
                     logger.debug(f"Tool evaluation failed for span {span_id}: {e}")
@@ -774,13 +704,16 @@ def evaluate_spans(parsed_data: Dict[str, Any], model_config: AzureOpenAIModelCo
                     result = fluency_evaluator(response=assistant_response)
                     if result:
                         score = extract_score(result, ["fluency", "fluency_score", "score"])
-                        evaluations.append({
+                        eval_result = {
                             "metric": "fluency",
                             "score": normalize_score(score),
                             "reasoning": extract_reasoning(result),
                             "span_id": span_id,
                             "trace_id": trace_id
-                        })
+                        }
+                        if agent_id:
+                            eval_result["agent_id"] = agent_id
+                        evaluations.append(eval_result)
                         logger.debug(f"Fluency evaluation completed for span {span_id}: score={score}")
                 except Exception as e:
                     logger.debug(f"Fluency evaluation failed: {e}")
@@ -796,13 +729,16 @@ def evaluate_spans(parsed_data: Dict[str, Any], model_config: AzureOpenAIModelCo
                     result = coherence_evaluator(conversation=conversation)
                     if result:
                         score = extract_score(result, ["coherence", "coherence_score", "score"])
-                        evaluations.append({
+                        eval_result = {
                             "metric": "coherence",
                             "score": normalize_score(score),
                             "reasoning": extract_reasoning(result),
                             "span_id": span_id,
                             "trace_id": trace_id
-                        })
+                        }
+                        if agent_id:
+                            eval_result["agent_id"] = agent_id
+                        evaluations.append(eval_result)
                         logger.debug(f"Coherence evaluation completed for span {span_id}: score={score}")
                 except Exception as e:
                     logger.debug(f"Coherence evaluation failed: {e}")
@@ -813,13 +749,16 @@ def evaluate_spans(parsed_data: Dict[str, Any], model_config: AzureOpenAIModelCo
                         result = relevance_evaluator(query=user_query, response=assistant_response)
                         if result:
                             score = extract_score(result, ["relevance", "relevance_score", "score"])
-                            evaluations.append({
+                            eval_result = {
                                 "metric": "relevance",
                                 "score": normalize_score(score),
                                 "reasoning": extract_reasoning(result),
                                 "span_id": span_id,
                                 "trace_id": trace_id
-                            })
+                            }
+                            if agent_id:
+                                eval_result["agent_id"] = agent_id
+                            evaluations.append(eval_result)
                             logger.debug(f"Relevance evaluation completed for span {span_id}: score={score}")
                     except Exception as e:
                         logger.debug(f"Relevance evaluation failed: {e}")
@@ -833,13 +772,16 @@ def evaluate_spans(parsed_data: Dict[str, Any], model_config: AzureOpenAIModelCo
                         )
                         if result:
                             score = extract_score(result, ["groundedness", "groundedness_score", "score"])
-                            evaluations.append({
+                            eval_result = {
                                 "metric": "groundedness",
                                 "score": normalize_score(score),
                                 "reasoning": extract_reasoning(result),
                                 "span_id": span_id,
                                 "trace_id": trace_id
-                            })
+                            }
+                            if agent_id:
+                                eval_result["agent_id"] = agent_id
+                            evaluations.append(eval_result)
                             logger.debug(f"Groundedness evaluation completed for span {span_id}: score={score}")
                     except Exception as e:
                         logger.debug(f"Groundedness evaluation failed: {e}")
@@ -849,7 +791,7 @@ def evaluate_spans(parsed_data: Dict[str, Any], model_config: AzureOpenAIModelCo
 
 
 def send_evaluation_as_trace(evaluation: Dict[str, Any]) -> None:
-    """Send evaluation result as a linked trace."""
+    """Send evaluation result as a linked trace following OpenTelemetry GenAI semantic conventions."""
     try:
         # Convert IDs to integers
         trace_id_int = int(evaluation["trace_id"].replace('-', '')[:32], 16) & ((1 << 128) - 1)
@@ -865,34 +807,52 @@ def send_evaluation_as_trace(evaluation: Dict[str, Any]) -> None:
         )
         link = Link(parent_context)
         
-        # Create evaluation span
+        # Determine pass/fail label based on score
+        score_label = "pass" if evaluation["score"] >= 3.0 else "fail"
+        
+        # Create evaluation span with proper naming
+        span_name = f"evaluation.{evaluation['metric']}"
+        
         with tracer.start_as_current_span(
-            name=f"evaluation.{evaluation['metric']}",
+            name=span_name,
             links=[link]
         ) as span:
-            # Set attributes
-            span.set_attribute("evaluation.metric", evaluation["metric"])
-            span.set_attribute("evaluation.score", evaluation["score"])
-            span.set_attribute("evaluation.reasoning", evaluation["reasoning"])
-            span.set_attribute("evaluation.original_trace_id", evaluation["trace_id"])
-            span.set_attribute("evaluation.original_span_id", evaluation["span_id"])
-            span.set_attribute("evaluation.result", "pass" if evaluation["score"] >= 3.0 else "fail")
+            # Set attributes following OpenTelemetry GenAI semantic conventions
             
-            # Add event
+            # Core evaluation attributes
+            span.set_attribute("gen_ai.evaluation.name", evaluation["metric"])
+            span.set_attribute("gen_ai.evaluation.score.value", float(evaluation["score"]))
+            span.set_attribute("gen_ai.evaluation.score.label", score_label)
+            span.set_attribute("gen_ai.evaluation.explanation", evaluation["reasoning"])
+            
+            # Add operation name for evaluation
+            span.set_attribute("gen_ai.operation.name", "evaluate")
+            
+            # Link to original trace/span
+            span.set_attribute("gen_ai.evaluation.original_trace_id", evaluation["trace_id"])
+            span.set_attribute("gen_ai.evaluation.original_span_id", evaluation["span_id"])
+            
+            # Additional metadata
+            span.set_attribute("gen_ai.evaluation.threshold", 3.0)
+            span.set_attribute("gen_ai.evaluation.max_score", 5.0)
+            
+            # Add event with evaluation details
+            event_attributes = {
+                "gen_ai.evaluation.score.value": float(evaluation["score"]),
+                "gen_ai.evaluation.score.label": score_label,
+                "gen_ai.evaluation.explanation": evaluation["reasoning"][:500] if len(evaluation["reasoning"]) > 500 else evaluation["reasoning"]
+            }
+            
             span.add_event(
-                name=f"evaluation.{evaluation['metric']}.completed",
-                attributes={
-                    "score": evaluation["score"],
-                    "result": "pass" if evaluation["score"] >= 3.0 else "fail",
-                    "reasoning": evaluation["reasoning"][:500] if len(evaluation["reasoning"]) > 500 else evaluation["reasoning"]
-                }
+                name=f"gen_ai.evaluation.{evaluation['metric']}.completed",
+                attributes=event_attributes
             )
             
-            # Set status
+            # Set status based on evaluation result
             if evaluation["score"] >= 3.0:
-                span.set_status(Status(StatusCode.OK))
+                span.set_status(Status(StatusCode.OK, f"Evaluation passed with score {evaluation['score']}/5.0"))
             else:
-                span.set_status(Status(StatusCode.ERROR, f"Score below threshold: {evaluation['score']}/5.0"))
+                span.set_status(Status(StatusCode.ERROR, f"Evaluation failed with score {evaluation['score']}/5.0"))
     
     except Exception as e:
         logger.error(f"Failed to send evaluation trace: {e}")
@@ -1038,6 +998,10 @@ def main():
     
     logger.info(f"Parsed {len(parsed_data['spans'])} spans from trace {trace_id}")
     
+    # Log agent ID if found
+    if "agent_id" in parsed_data:
+        logger.info(f"Found agent ID: {parsed_data['agent_id']}")
+    
     # Configure evaluation model
     model_config = AzureOpenAIModelConfiguration(
         azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
@@ -1093,6 +1057,10 @@ def main():
         "trace_records": trace_records  # Include original records for reference
     }
     
+    # Add agent_id to output if found
+    if "agent_id" in parsed_data:
+        output_data["agent_id"] = parsed_data["agent_id"]
+    
     # Save results
     with open(args.output, 'w') as f:
         json.dump(output_data, f, indent=2, default=str)
@@ -1104,6 +1072,8 @@ def main():
     print("EVALUATION SUMMARY")
     print("="*80)
     print(f"Trace ID: {output_data['trace_id']}")
+    if "agent_id" in output_data:
+        print(f"Agent ID: {output_data['agent_id']}")
     print(f"Total Spans: {output_data['total_spans']}")
     print(f"Total Evaluations: {output_data['total_evaluations']}")
     
